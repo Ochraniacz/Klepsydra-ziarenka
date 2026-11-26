@@ -3,6 +3,7 @@ package com.damian.klepsydraziarenka
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.graphics.Camera
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Matrix
@@ -12,6 +13,8 @@ import android.graphics.RectF
 import android.os.BatteryManager
 import android.service.dreams.DreamService
 import android.view.View
+import kotlin.math.abs
+import kotlin.math.cos
 import kotlin.math.sin
 import kotlin.random.Random
 
@@ -59,18 +62,28 @@ class HourglassDreamService : DreamService() {
         private var batteryLevelFraction = 0.5f // 0.0f .. 1.0f
         private var isCharging = false
 
-        private val pourDurationMs = 60_000L // 60 s przesypywania w dół ekranu
-        private val flipDurationMs = 1_200L  // 1,2 s obrotu klepsydry o 180°
+        private val pourDurationMs = 60_000L // 60 s przesypywania piasku
+        private val flipDurationMs = 1_400L  // 1,4 s realistycznego obrotu 3D
         private val fullCycleMs = pourDurationMs + flipDurationMs
 
         private val glassPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = Color.argb(150, 200, 220, 240)
+            color = Color.argb(165, 210, 230, 248)
             style = Paint.Style.STROKE
             strokeWidth = 5f
         }
 
+        private val glassHighlightPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.argb(65, 255, 255, 255)
+            style = Paint.Style.FILL
+        }
+
         private val framePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
             color = Color.rgb(176, 125, 79)
+            style = Paint.Style.FILL
+        }
+
+        private val frameShadePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.rgb(122, 82, 48)
             style = Paint.Style.FILL
         }
 
@@ -93,6 +106,11 @@ class HourglassDreamService : DreamService() {
             style = Paint.Style.FILL
         }
 
+        private val bottomBarFillPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.argb(185, 224, 169, 109)
+            style = Paint.Style.FILL
+        }
+
         private val barBorderPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
             color = Color.argb(110, 220, 230, 240)
             style = Paint.Style.STROKE
@@ -101,8 +119,12 @@ class HourglassDreamService : DreamService() {
 
         private val sandPath = Path()
         private val baseGlassPath = Path()
-        private val rotatedGlassPath = Path()
-        private val rotateMatrix = Matrix()
+        private val transformedGlassPath = Path()
+        private val camera3D = Camera().apply {
+            setLocation(0f, 0f, -12f)
+        }
+        private val matrix3D = Matrix()
+        private val centerShiftMatrix = Matrix()
         private val trackRect = RectF()
         private val fillRect = RectF()
         private val random = Random(System.currentTimeMillis())
@@ -139,7 +161,6 @@ class HourglassDreamService : DreamService() {
 
         private fun redToGreenColor(fraction: Float): Int {
             val t = fraction.coerceIn(0f, 1f)
-            // Płynne przejście: czerwony (220, 45, 45) -> żółty (235, 195, 35) -> zielony (45, 205, 85)
             val r: Int
             val g: Int
             val b: Int
@@ -221,6 +242,17 @@ class HourglassDreamService : DreamService() {
             path.close()
         }
 
+        private fun apply3DRotate(path: Path, cx: Float, cy: Float, angleDeg: Float, outPath: Path) {
+            camera3D.save()
+            camera3D.rotateX(angleDeg)
+            camera3D.getMatrix(matrix3D)
+            camera3D.restore()
+
+            matrix3D.preTranslate(-cx, -cy)
+            matrix3D.postTranslate(cx, cy)
+            path.transform(matrix3D, outPath)
+        }
+
         private fun drawTopBatteryBar(canvas: Canvas, w: Float, h: Float, shiftX: Float, elapsed: Long) {
             val barWidth = w * 0.52f
             val barHeight = (h * 0.014f).coerceIn(10f, 22f)
@@ -238,6 +270,33 @@ class HourglassDreamService : DreamService() {
                 fillRect.set(left, top, left + fillWidth, bottom)
                 barFillPaint.color = redToGreenColor(batteryLevelFraction)
                 canvas.drawRoundRect(fillRect, radius, radius, barFillPaint)
+            }
+
+            canvas.drawRoundRect(trackRect, radius, radius, barBorderPaint)
+        }
+
+        private fun drawBottomCycleBar(canvas: Canvas, w: Float, h: Float, shiftX: Float, elapsed: Long, pourProgress: Float) {
+            val barWidth = w * 0.52f
+            val barHeight = (h * 0.012f).coerceIn(8f, 18f)
+            val left = (w - barWidth) / 2f - shiftX * 0.6f
+            val right = left + barWidth
+            val bottom = (h * 0.945f) + (cos(elapsed / 12000.0).toFloat() * (h * 0.01f))
+            val top = bottom - barHeight
+            val radius = barHeight / 2f
+
+            trackRect.set(left, top, right, bottom)
+            canvas.drawRoundRect(trackRect, radius, radius, barTrackPaint)
+
+            val remainingFraction = (1f - pourProgress).coerceIn(0f, 1f)
+            val fillWidth = if (remainingFraction > 0f) {
+                (barWidth * remainingFraction).coerceAtLeast(barHeight)
+            } else {
+                0f
+            }
+
+            if (fillWidth > 0f) {
+                fillRect.set(left, top, left + fillWidth, bottom)
+                canvas.drawRoundRect(fillRect, radius, radius, bottomBarFillPaint)
             }
 
             canvas.drawRoundRect(trackRect, radius, radius, barBorderPaint)
@@ -268,14 +327,18 @@ class HourglassDreamService : DreamService() {
                 0f
             }
 
-            val glassAngle = (cycleIndex * 180f) + (180f * flipT)
+            // Realistyczny obrót 3D wokół osi poziomej (0° -> 180° -> 360°...)
+            val angle3D = (cycleIndex * 180f) + (180f * flipT)
 
             // Pixel-shift chroniący matrycę OLED
             val shiftX = sin(elapsed / 9000.0).toFloat() * (w * 0.03f)
             val shiftY = sin(elapsed / 13000.0).toFloat() * (h * 0.03f)
 
-            // Pasek naładowania na górze ekranu
+            // Górny pasek: stan baterii (czerwony -> żółty -> zielony)
             drawTopBatteryBar(canvas, w, h, shiftX, elapsed)
+
+            // Dolny pasek: pozostały czas bieżącego cyklu sypania
+            drawBottomCycleBar(canvas, w, h, shiftX, elapsed, pourProgress)
 
             val cx = w / 2f + shiftX
             val cy = h / 2f + shiftY
@@ -289,23 +352,24 @@ class HourglassDreamService : DreamService() {
             val bottomY = cy + hourglassHalfHeight
 
             buildGlassPath(baseGlassPath, cx, cy, hourglassHalfWidth, hourglassHalfHeight, neckHalfWidth)
-            rotateMatrix.setRotate(glassAngle, cx, cy)
-            baseGlassPath.transform(rotateMatrix, rotatedGlassPath)
+            apply3DRotate(baseGlassPath, cx, cy, angle3D, transformedGlassPath)
 
+            // Podczas obrotu 3D cała bańka z piaskiem jedzie na górę razem ze szkłem;
+            // podczas sypania poziom piasku i ziarenka poruszają się naturalnie w dół ekranu.
             val topFill = if (isFlipping) 1f else (1f - pourProgress)
             val bottomFill = if (isFlipping) 0f else pourProgress
 
-            // 1. Piasek przycięty do aktualnego kształtu obróconego szkła
+            // 1. Piasek przycięty do rzutu 3D klepsydry
             canvas.save()
-            canvas.clipPath(rotatedGlassPath)
+            canvas.clipPath(transformedGlassPath)
 
             if (topFill > 0.01f) {
                 val sandTopY = cy - hourglassHalfHeight * topFill
                 sandPath.reset()
-                sandPath.moveTo(cx - hourglassHalfWidth * 1.4f, sandTopY)
-                sandPath.quadTo(cx, sandTopY + 18f * (1f - topFill), cx + hourglassHalfWidth * 1.4f, sandTopY)
-                sandPath.lineTo(cx + hourglassHalfWidth * 1.4f, cy)
-                sandPath.lineTo(cx - hourglassHalfWidth * 1.4f, cy)
+                sandPath.moveTo(cx - hourglassHalfWidth * 1.5f, sandTopY)
+                sandPath.quadTo(cx, sandTopY + 18f * (1f - topFill), cx + hourglassHalfWidth * 1.5f, sandTopY)
+                sandPath.lineTo(cx + hourglassHalfWidth * 1.5f, cy)
+                sandPath.lineTo(cx - hourglassHalfWidth * 1.5f, cy)
                 sandPath.close()
                 canvas.drawPath(sandPath, sandPaint)
             }
@@ -314,14 +378,25 @@ class HourglassDreamService : DreamService() {
                 val sandSurfaceY = bottomY - hourglassHalfHeight * bottomFill
                 val conePeakY = (sandSurfaceY - 26f * (1f - bottomFill * 0.6f)).coerceAtLeast(cy + 4f)
                 sandPath.reset()
-                sandPath.moveTo(cx - hourglassHalfWidth * 1.4f, sandSurfaceY + 10f)
+                sandPath.moveTo(cx - hourglassHalfWidth * 1.5f, sandSurfaceY + 10f)
                 sandPath.lineTo(cx, conePeakY)
-                sandPath.lineTo(cx + hourglassHalfWidth * 1.4f, sandSurfaceY + 10f)
-                sandPath.lineTo(cx + hourglassHalfWidth * 1.4f, bottomY + hourglassHalfHeight)
-                sandPath.lineTo(cx - hourglassHalfWidth * 1.4f, bottomY + hourglassHalfHeight)
+                sandPath.lineTo(cx + hourglassHalfWidth * 1.5f, sandSurfaceY + 10f)
+                sandPath.lineTo(cx + hourglassHalfWidth * 1.5f, bottomY + hourglassHalfHeight)
+                sandPath.lineTo(cx - hourglassHalfWidth * 1.5f, bottomY + hourglassHalfHeight)
                 sandPath.close()
                 canvas.drawPath(sandPath, sandPaint)
             }
+
+            // Delikatny połysk szkła w 3D (zmienia się w zależności od kąta obrotu)
+            val sheenAlpha = (abs(cos(Math.toRadians(angle3D.toDouble()))) * 55.0).toInt().coerceIn(10, 65)
+            glassHighlightPaint.alpha = sheenAlpha
+            canvas.drawRect(
+                cx - hourglassHalfWidth * 0.45f,
+                topY - hourglassHalfHeight * 0.5f,
+                cx - hourglassHalfWidth * 0.12f,
+                bottomY + hourglassHalfHeight * 0.5f,
+                glassHighlightPaint
+            )
 
             // 2. Spadające ziarenka — zawsze lecą w dół ekranu podczas sypania
             if (!isFlipping && pourProgress < 0.995f) {
@@ -338,31 +413,40 @@ class HourglassDreamService : DreamService() {
 
             canvas.restore()
 
-            // 3. Szkło i podstawy obrócone o glassAngle
-            canvas.save()
-            canvas.rotate(glassAngle, cx, cy)
-            canvas.drawPath(baseGlassPath, glassPaint)
+            // 3. Szkło i górna/dolna podstawa w rzucie 3D
+            canvas.drawPath(transformedGlassPath, glassPaint)
 
             val capHalfWidth = hourglassHalfWidth * 1.15f
-            canvas.drawRoundRect(
-                cx - capHalfWidth,
-                topY - capHeight,
-                cx + capHalfWidth,
-                topY,
-                10f,
-                10f,
-                framePaint
-            )
-            canvas.drawRoundRect(
-                cx - capHalfWidth,
-                bottomY,
-                cx + capHalfWidth,
-                bottomY + capHeight,
-                10f,
-                10f,
-                framePaint
-            )
-            canvas.restore()
+            val topCapPath = Path().apply {
+                addRoundRect(
+                    cx - capHalfWidth,
+                    topY - capHeight,
+                    cx + capHalfWidth,
+                    topY,
+                    10f,
+                    10f,
+                    Path.Direction.CW
+                )
+            }
+            val bottomCapPath = Path().apply {
+                addRoundRect(
+                    cx - capHalfWidth,
+                    bottomY,
+                    cx + capHalfWidth,
+                    bottomY + capHeight,
+                    10f,
+                    10f,
+                    Path.Direction.CW
+                )
+            }
+
+            val transformedTopCap = Path()
+            val transformedBottomCap = Path()
+            apply3DRotate(topCapPath, cx, cy, angle3D, transformedTopCap)
+            apply3DRotate(bottomCapPath, cx, cy, angle3D, transformedBottomCap)
+
+            canvas.drawPath(transformedTopCap, framePaint)
+            canvas.drawPath(transformedBottomCap, frameShadePaint)
         }
     }
 }
