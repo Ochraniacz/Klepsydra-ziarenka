@@ -1,392 +1,255 @@
 package com.damian.klepsydraziarenka
 
+import android.content.Context
 import android.graphics.Canvas
 import android.graphics.Color
-import android.graphics.LinearGradient
 import android.graphics.Paint
 import android.graphics.Path
-import android.graphics.Shader
-import android.os.Handler
-import android.os.Looper
 import android.service.dreams.DreamService
 import android.view.View
-import kotlin.math.PI
-import kotlin.math.cos
-import kotlin.math.min
 import kotlin.math.sin
 import kotlin.random.Random
 
 class HourglassDreamService : DreamService() {
 
-    private val handler = Handler(Looper.getMainLooper())
-    private var hourglassView: HourglassCanvasView? = null
-
-    private val frameRunnable = object : Runnable {
-        override fun run() {
-            hourglassView?.stepAndInvalidate()
-            handler.postDelayed(this, 16L) // ~60 FPS
-        }
-    }
+    private var hourglassView: HourglassView? = null
 
     override fun onAttachedToWindow() {
         super.onAttachedToWindow()
+
         isInteractive = false
         isFullscreen = true
-        screenBrightness = 0.05f // Łagodne podświetlenie pod ekran OLED / noc
+        isScreenBright = false
 
-        val view = HourglassCanvasView(this)
+        window?.attributes = window?.attributes?.apply {
+            screenBrightness = 0.05f
+        }
+
+        val view = HourglassView(this)
         hourglassView = view
         setContentView(view)
     }
 
     override fun onDreamingStarted() {
         super.onDreamingStarted()
-        handler.removeCallbacks(frameRunnable)
-        handler.post(frameRunnable)
+        hourglassView?.startAnimation()
     }
 
     override fun onDreamingStopped() {
-        handler.removeCallbacks(frameRunnable)
+        hourglassView?.stopAnimation()
         super.onDreamingStopped()
     }
 
     override fun onDetachedFromWindow() {
-        handler.removeCallbacks(frameRunnable)
         hourglassView = null
         super.onDetachedFromWindow()
     }
-}
 
-private data class SandGrain(
-    var x: Float,
-    var y: Float,
-    var vx: Float,
-    var vy: Float,
-    val radius: Float,
-    val color: Int,
-    var settled: Boolean = false
-)
+    private class HourglassView(context: Context) : View(context) {
 
-private class HourglassCanvasView(context: android.content.Context) : View(context) {
+        private var isRunning = false
+        private var startTimeMs = 0L
+        private val cycleDurationMs = 60_000L // Pełny cykl przesypania: 60 sekund
 
-    private val random = Random(System.currentTimeMillis())
+        private val glassPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.argb(140, 200, 220, 240)
+            style = Paint.Style.STROKE
+            strokeWidth = 5f
+        }
 
-    private val bgPaint = Paint().apply {
-        color = Color.parseColor("#06070A")
-    }
+        private val framePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.rgb(176, 125, 79)
+            style = Paint.Style.FILL
+        }
 
-    private val capPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        style = Paint.Style.FILL
-    }
+        private val sandPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.rgb(224, 169, 109)
+            style = Paint.Style.FILL
+        }
 
-    private val glassFillPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        style = Paint.Style.FILL
-    }
+        private val grainPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.rgb(244, 213, 141)
+            style = Paint.Style.FILL
+        }
 
-    private val glassStrokePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        style = Paint.Style.STROKE
-        strokeCap = Paint.Cap.ROUND
-        strokeJoin = Paint.Join.ROUND
-    }
+        private val sandPath = Path()
+        private val clipPath = Path()
+        private val random = Random(System.currentTimeMillis())
 
-    private val highlightPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        style = Paint.Style.STROKE
-        strokeCap = Paint.Cap.ROUND
-    }
+        private val frameRunnable = object : Runnable {
+            override fun run() {
+                if (!isRunning) return
+                invalidate()
+                postDelayed(this, 16L) // ~60 FPS
+            }
+        }
 
-    private val grainPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        style = Paint.Style.FILL
-    }
+        fun startAnimation() {
+            if (!isRunning) {
+                isRunning = true
+                startTimeMs = System.currentTimeMillis()
+                post(frameRunnable)
+            }
+        }
 
-    private val grainColors = intArrayOf(
-        Color.parseColor("#F5B041"),
-        Color.parseColor("#E59824"),
-        Color.parseColor("#F8C471"),
-        Color.parseColor("#D68910"),
-        Color.parseColor("#FAD7A0")
-    )
+        fun stopAnimation() {
+            isRunning = false
+            removeCallbacks(frameRunnable)
+        }
 
-    private val fallingGrains = mutableListOf<SandGrain>()
-    private val settledGrains = mutableListOf<SandGrain>()
+        override fun onDraw(canvas: Canvas) {
+            super.onDraw(canvas)
+            canvas.drawColor(Color.BLACK)
 
-    private var topProgress = 1.0f // 1.0 = pełna górna komora, 0.0 = pusta
-    private var bottomProgress = 0.0f // 0.0 = pusta dolna komora, 1.0 = pełna
-    private var spawnAccumulator = 0f
+            val w = width.toFloat()
+            val h = height.toFloat()
+            if (w <= 0f || h <= 0f) return
 
-    private var centerX = 0f
-    private var centerY = 0f
-    private var hourglassWidth = 0f
-    private var hourglassHeight = 0f
-    private var neckY = 0f
-    private var topBulbTopY = 0f
-    private var bottomBulbBottomY = 0f
+            val elapsed = System.currentTimeMillis() - startTimeMs
+            val progress = ((elapsed % cycleDurationMs).toFloat() / cycleDurationMs.toFloat()).coerceIn(0f, 1f)
 
-    override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
-        super.onSizeChanged(w, h, oldw, oldh)
-        centerX = w * 0.5f
-        centerY = h * 0.5f
+            // Delikatny ruch (pixel-shift) chroniący matrycę OLED przed wypaleniem
+            val shiftX = sin(elapsed / 9000.0).toFloat() * (w * 0.04f)
+            val shiftY = sin(elapsed / 13000.0).toFloat() * (h * 0.04f)
 
-        val baseSize = min(w, h).toFloat()
-        hourglassWidth = baseSize * 0.54f
-        hourglassHeight = hourglassWidth * 1.48f
+            val cx = w / 2f + shiftX
+            val cy = h / 2f + shiftY
 
-        neckY = centerY
-        topBulbTopY = centerY - hourglassHeight * 0.42f
-        bottomBulbBottomY = centerY + hourglassHeight * 0.42f
+            val hourglassHalfWidth = minOf(w, h) * 0.22f
+            val hourglassHalfHeight = minOf(w, h) * 0.34f
+            val neckHalfWidth = hourglassHalfWidth * 0.09f
+            val capHeight = hourglassHalfHeight * 0.09f
 
-        val capHeight = hourglassHeight * 0.065f
-        val capWidth = hourglassWidth * 1.12f
+            val topY = cy - hourglassHalfHeight
+            val bottomY = cy + hourglassHalfHeight
 
-        capPaint.shader = LinearGradient(
-            centerX - capWidth * 0.5f,
-            topBulbTopY - capHeight,
-            centerX + capWidth * 0.5f,
-            topBulbTopY,
-            intArrayOf(
-                Color.parseColor("#232730"),
-                Color.parseColor("#3B4252"),
-                Color.parseColor("#1B1E26")
-            ),
-            null,
-            Shader.TileMode.CLAMP
-        )
-
-        glassFillPaint.shader = LinearGradient(
-            centerX - hourglassWidth * 0.5f,
-            topBulbTopY,
-            centerX + hourglassWidth * 0.5f,
-            bottomBulbBottomY,
-            intArrayOf(
-                Color.argb(26, 255, 255, 255),
-                Color.argb(10, 220, 235, 255),
-                Color.argb(24, 255, 255, 255)
-            ),
-            null,
-            Shader.TileMode.CLAMP
-        )
-
-        glassStrokePaint.strokeWidth = maxOf(2.5f, hourglassWidth * 0.016f)
-        glassStrokePaint.color = Color.parseColor("#8A96A8")
-
-        highlightPaint.strokeWidth = maxOf(2f, hourglassWidth * 0.012f)
-        highlightPaint.color = Color.argb(95, 255, 255, 255)
-    }
-
-    fun stepAndInvalidate() {
-        val dt = 0.016f
-
-        if (topProgress > 0.02f) {
-            topProgress = (topProgress - dt * 0.018f).coerceAtLeast(0.02f)
-            bottomProgress = (1.0f - topProgress).coerceIn(0f, 1f)
-            spawnAccumulator += dt * 42f
-
-            while (spawnAccumulator >= 1f && fallingGrains.size < 160) {
-                spawnAccumulator -= 1f
-                val spread = maxOf(1.5f, hourglassWidth * 0.022f)
-                fallingGrains.add(
-                    SandGrain(
-                        x = centerX + random.nextFloat().minus(0.5f) * spread,
-                        y = neckY + 2f,
-                        vx = random.nextFloat().minus(0.5f) * 18f,
-                        vy = 95f + random.nextFloat() * 45f,
-                        radius = maxOf(1.8f, hourglassWidth * (0.008f + random.nextFloat() * 0.007f)),
-                        color = grainColors[random.nextInt(grainColors.size)]
-                    )
+            // Górny piasek (ubywa)
+            val topFill = 1f - progress
+            if (topFill > 0.01f) {
+                canvas.save()
+                clipPath.reset()
+                clipPath.moveTo(cx - hourglassHalfWidth, topY)
+                clipPath.lineTo(cx + hourglassHalfWidth, topY)
+                clipPath.cubicTo(
+                    cx + hourglassHalfWidth, topY + hourglassHalfHeight * 0.45f,
+                    cx + neckHalfWidth, cy - hourglassHalfHeight * 0.12f,
+                    cx + neckHalfWidth, cy
                 )
-            }
-        } else {
-            // Płynne przewrócenie cyklu po opróżnieniu górnej bańki
-            topProgress = 1.0f
-            bottomProgress = 0.0f
-            settledGrains.clear()
-        }
+                clipPath.lineTo(cx - neckHalfWidth, cy)
+                clipPath.cubicTo(
+                    cx - neckHalfWidth, cy - hourglassHalfHeight * 0.12f,
+                    cx - hourglassHalfWidth, topY + hourglassHalfHeight * 0.45f,
+                    cx - hourglassHalfWidth, topY
+                )
+                clipPath.close()
+                canvas.clipPath(clipPath)
 
-        val iterator = fallingGrains.iterator()
-        while (iterator.hasNext()) {
-            val g = iterator.next()
-            g.vy += 420f * dt
-            g.x += g.vx * dt
-            g.y += g.vy * dt
-
-            val maxHalfWidthAtY = bulbHalfWidthAt(g.y) * 0.86f
-            if (g.x < centerX - maxHalfWidthAtY) {
-                g.x = centerX - maxHalfWidthAtY
-                g.vx = kotlin.math.abs(g.vx) * 0.35f
-            } else if (g.x > centerX + maxHalfWidthAtY) {
-                g.x = centerX + maxHalfWidthAtY
-                g.vx = -kotlin.math.abs(g.vx) * 0.35f
+                val sandTopY = cy - hourglassHalfHeight * topFill
+                sandPath.reset()
+                sandPath.moveTo(cx - hourglassHalfWidth * 1.2f, sandTopY)
+                sandPath.quadTo(cx, sandTopY + 18f * (1f - topFill), cx + hourglassHalfWidth * 1.2f, sandTopY)
+                sandPath.lineTo(cx + hourglassHalfWidth * 1.2f, cy)
+                sandPath.lineTo(cx - hourglassHalfWidth * 1.2f, cy)
+                sandPath.close()
+                canvas.drawPath(sandPath, sandPaint)
+                canvas.restore()
             }
 
-            val moundTopY = currentBottomMoundTopY(g.x)
-            if (g.y >= moundTopY) {
-                g.y = moundTopY
-                g.settled = true
-                if (settledGrains.size < 420) {
-                    settledGrains.add(g)
+            // Dolny piasek (przybywa)
+            val bottomFill = progress
+            if (bottomFill > 0.01f) {
+                canvas.save()
+                clipPath.reset()
+                clipPath.moveTo(cx - neckHalfWidth, cy)
+                clipPath.lineTo(cx + neckHalfWidth, cy)
+                clipPath.cubicTo(
+                    cx + neckHalfWidth, cy + hourglassHalfHeight * 0.12f,
+                    cx + hourglassHalfWidth, bottomY - hourglassHalfHeight * 0.45f,
+                    cx + hourglassHalfWidth, bottomY
+                )
+                clipPath.lineTo(cx - hourglassHalfWidth, bottomY)
+                clipPath.cubicTo(
+                    cx - hourglassHalfWidth, bottomY - hourglassHalfHeight * 0.45f,
+                    cx - neckHalfWidth, cy + hourglassHalfHeight * 0.12f,
+                    cx - neckHalfWidth, cy
+                )
+                clipPath.close()
+                canvas.clipPath(clipPath)
+
+                val sandSurfaceY = bottomY - hourglassHalfHeight * bottomFill
+                val conePeakY = (sandSurfaceY - 26f * (1f - bottomFill * 0.6f)).coerceAtLeast(cy + 4f)
+                sandPath.reset()
+                sandPath.moveTo(cx - hourglassHalfWidth * 1.2f, sandSurfaceY + 10f)
+                sandPath.lineTo(cx, conePeakY)
+                sandPath.lineTo(cx + hourglassHalfWidth * 1.2f, sandSurfaceY + 10f)
+                sandPath.lineTo(cx + hourglassHalfWidth * 1.2f, bottomY)
+                sandPath.lineTo(cx - hourglassHalfWidth * 1.2f, bottomY)
+                sandPath.close()
+                canvas.drawPath(sandPath, sandPaint)
+                canvas.restore()
+            }
+
+            // Strumień spadających ziarenek
+            if (progress < 0.99f) {
+                val streamBottom = bottomY - hourglassHalfHeight * bottomFill
+                canvas.drawLine(cx, cy, cx, streamBottom, grainPaint)
+
+                for (i in 0 until 14) {
+                    val t = ((elapsed / 450.0 + i * 0.07) % 1.0).toFloat()
+                    val gy = cy + (streamBottom - cy) * t
+                    val gx = cx + (random.nextFloat() - 0.5f) * (neckHalfWidth * 1.2f)
+                    canvas.drawCircle(gx, gy, 2.5f, grainPaint)
                 }
-                iterator.remove()
-            }
-        }
-
-        invalidate()
-    }
-
-    private fun bulbHalfWidthAt(y: Float): Float {
-        val halfH = hourglassHeight * 0.42f
-        val dy = (y - neckY) / halfH
-        val clamped = dy.coerceIn(-1f, 1f)
-        // Kształt ⌛: łagodnie wygięte ścianki zwężające się do szyjki na środku
-        val neckHalfWidth = hourglassWidth * 0.045f
-        val wideHalfWidth = hourglassWidth * 0.50f
-        val curve = sin(kotlin.math.abs(clamped) * PI * 0.5).toFloat()
-        return neckHalfWidth + (wideHalfWidth - neckHalfWidth) * curve
-    }
-
-    private fun currentBottomMoundTopY(x: Float): Float {
-        val moundHeight = hourglassHeight * 0.34f * bottomProgress
-        val baseY = bottomBulbBottomY - hourglassHeight * 0.03f
-        val peakY = baseY - moundHeight
-        val maxSpan = maxOf(12f, hourglassWidth * 0.42f * (0.25f + 0.75f * bottomProgress))
-        val dxRatio = ((x - centerX) / maxSpan).coerceIn(-1f, 1f)
-        // Stożek usypujący się na środku pod strumieniem ziaren
-        val coneFactor = 1f - kotlin.math.abs(dxRatio)
-        return baseY - moundHeight * coneFactor
-    }
-
-    override fun onDraw(canvas: Canvas) {
-        super.onDraw(canvas)
-        if (width == 0 || height == 0) return
-
-        canvas.drawRect(0f, 0f, width.toFloat(), height.toFloat(), bgPaint)
-
-        val halfH = hourglassHeight * 0.42f
-        val steps = 32
-        val glassPath = Path()
-
-        // Prawa ścianka od góry do szyjki i w dół do podstawy
-        for (i in 0..steps) {
-            val t = i.toFloat() / steps
-            val y = (neckY - halfH) + t * (halfH * 2f)
-            val hw = bulbHalfWidthAt(y)
-            val px = centerX + hw
-            if (i == 0) glassPath.moveTo(px, y) else glassPath.lineTo(px, y)
-        }
-
-        // Lewa ścianka od dołu do góry
-        for (i in steps downTo 0) {
-            val t = i.toFloat() / steps
-            val y = (neckY - halfH) + t * (halfH * 2f)
-            val hw = bulbHalfWidthAt(y)
-            val px = centerX - hw
-            glassPath.lineTo(px, y)
-        }
-        glassPath.close()
-
-        canvas.drawPath(glassPath, glassFillPaint)
-
-        // Piasek w górnej bańce (opadający poziom)
-        val topSandHeight = hourglassHeight * 0.32f * topProgress
-        if (topSandHeight > 4f) {
-            val sandBottomY = neckY - hourglassHeight * 0.02f
-            val sandTopY = maxOf(topBulbTopY + hourglassHeight * 0.04f, sandBottomY - topSandHeight)
-            val topHalfW = bulbHalfWidthAt(sandTopY) * 0.90f
-            val neckHalfW = bulbHalfWidthAt(sandBottomY) * 0.95f
-
-            val topSandPath = Path().apply {
-                moveTo(centerX - topHalfW, sandTopY)
-                lineTo(centerX + topHalfW, sandTopY)
-                lineTo(centerX + neckHalfW, sandBottomY)
-                lineTo(centerX - neckHalfW, sandBottomY)
-                close()
             }
 
-            grainPaint.color = Color.parseColor("#E59824")
-            canvas.drawPath(topSandPath, grainPaint)
+            // Szklany kontur klepsydry
+            sandPath.reset()
+            sandPath.moveTo(cx - hourglassHalfWidth, topY)
+            sandPath.lineTo(cx + hourglassHalfWidth, topY)
+            sandPath.cubicTo(
+                cx + hourglassHalfWidth, topY + hourglassHalfHeight * 0.45f,
+                cx + neckHalfWidth, cy - hourglassHalfHeight * 0.12f,
+                cx + neckHalfWidth, cy
+            )
+            sandPath.cubicTo(
+                cx + neckHalfWidth, cy + hourglassHalfHeight * 0.12f,
+                cx + hourglassHalfWidth, bottomY - hourglassHalfHeight * 0.45f,
+                cx + hourglassHalfWidth, bottomY
+            )
+            sandPath.lineTo(cx - hourglassHalfWidth, bottomY)
+            sandPath.cubicTo(
+                cx - hourglassHalfWidth, bottomY - hourglassHalfHeight * 0.45f,
+                cx - neckHalfWidth, cy + hourglassHalfHeight * 0.12f,
+                cx - neckHalfWidth, cy
+            )
+            sandPath.cubicTo(
+                cx - neckHalfWidth, cy - hourglassHalfHeight * 0.12f,
+                cx - hourglassHalfWidth, topY + hourglassHalfHeight * 0.45f,
+                cx - hourglassHalfWidth, topY
+            )
+            sandPath.close()
+            canvas.drawPath(sandPath, glassPaint)
 
-            // Drobne ziarenka tekstury na wierzchu górnego piasku
-            val grainCountTop = 28
-            for (i in 0 until grainCountTop) {
-                val frac = (i.toFloat() / (grainCountTop - 1)) - 0.5f
-                val gx = centerX + frac * topHalfW * 1.75f
-                val gy = sandTopY + sin(i * 1.7f) * 3.5f
-                grainPaint.color = grainColors[i % grainColors.size]
-                canvas.drawCircle(gx, gy, maxOf(1.6f, hourglassWidth * 0.008f), grainPaint)
-            }
-        }
-
-        // Dolny rosnący stożek piasku
-        if (bottomProgress > 0.01f) {
-            val baseY = bottomBulbBottomY - hourglassHeight * 0.03f
-            val moundHeight = hourglassHeight * 0.34f * bottomProgress
-            val peakY = baseY - moundHeight
-            val span = maxOf(10f, hourglassWidth * 0.42f * (0.25f + 0.75f * bottomProgress))
-
-            val bottomSandPath = Path().apply {
-                moveTo(centerX - span, baseY)
-                lineTo(centerX, peakY)
-                lineTo(centerX + span, baseY)
-                close()
-            }
-
-            grainPaint.color = Color.parseColor("#D68910")
-            canvas.drawPath(bottomSandPath, grainPaint)
-        }
-
-        // Osadzone pojedyncze ziarenka na kopcu
-        for (g in settledGrains) {
-            grainPaint.color = g.color
-            canvas.drawCircle(g.x, g.y, g.radius, grainPaint)
-        }
-
-        // Spadające ziarenka w strumieniu
-        for (g in fallingGrains) {
-            grainPaint.color = g.color
-            canvas.drawCircle(g.x, g.y, g.radius, grainPaint)
-        }
-
-        // Obrys szkła i delikatny refleks po lewej stronie
-        canvas.drawPath(glassPath, glassStrokePaint)
-
-        val reflectPath = Path().apply {
-            val startY = topBulbTopY + hourglassHeight * 0.07f
-            val endY = neckY - hourglassHeight * 0.06f
-            moveTo(centerX - bulbHalfWidthAt(startY) * 0.72f, startY)
-            quadTo(
-                centerX - bulbHalfWidthAt((startY + endY) * 0.5f) * 0.76f,
-                (startY + endY) * 0.5f,
-                centerX - bulbHalfWidthAt(endY) * 0.75f,
-                endY
+            // Górna i dolna podstawa klepsydry
+            val capHalfWidth = hourglassHalfWidth * 1.15f
+            canvas.drawRoundRect(
+                cx - capHalfWidth,
+                topY - capHeight,
+                cx + capHalfWidth,
+                topY,
+                10f,
+                10f,
+                framePaint
+            )
+            canvas.drawRoundRect(
+                cx - capHalfWidth,
+                bottomY,
+                cx + capHalfWidth,
+                bottomY + capHeight,
+                10f,
+                10f,
+                framePaint
             )
         }
-        canvas.drawPath(reflectPath, highlightPaint)
-
-        // Górna i dolna podstawa (kształt ⌛)
-        val capHeight = hourglassHeight * 0.065f
-        val capWidth = hourglassWidth * 1.12f
-        val cornerRadius = capHeight * 0.35f
-
-        canvas.drawRoundRect(
-            centerX - capWidth * 0.5f,
-            topBulbTopY - capHeight,
-            centerX + capWidth * 0.5f,
-            topBulbTopY + 2f,
-            cornerRadius,
-            cornerRadius,
-            capPaint
-        )
-
-        canvas.drawRoundRect(
-            centerX - capWidth * 0.5f,
-            bottomBulbBottomY - 2f,
-            centerX + capWidth * 0.5f,
-            bottomBulbBottomY + capHeight,
-            cornerRadius,
-            cornerRadius,
-            capPaint
-        )
-
-        // Delikatny ruch oddechowy całej sceny dla ochrony OLED
-        val swayX = cos(System.currentTimeMillis() * 0.0004) * 2.0
-        canvas.translate(swayX.toFloat(), 0f)
     }
 }
