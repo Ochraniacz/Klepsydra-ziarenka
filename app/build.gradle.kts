@@ -6,7 +6,7 @@ plugins {
 
 android {
     namespace = "com.damian.klepsydraziarenka"
-    compileSdk = 34
+    compileSdk = 35
 
     defaultConfig {
         applicationId = "com.damian.klepsydraziarenka"
