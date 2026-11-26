@@ -50,12 +50,12 @@ class HourglassDreamService : DreamService() {
         private var isRunning = false
         private var startTimeMs = 0L
 
-        private val pourDurationMs = 60_000L // 1 minuta przesypywania piasku
-        private val flipDurationMs = 1_200L  // 1.2 s płynnego obrotu o 180°
+        private val pourDurationMs = 60_000L // 60 s sypania w dół
+        private val flipDurationMs = 1_200L  // 1,2 s obrotu klepsydry o 180°
         private val fullCycleMs = pourDurationMs + flipDurationMs
 
         private val glassPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = Color.argb(140, 200, 220, 240)
+            color = Color.argb(150, 200, 220, 240)
             style = Paint.Style.STROKE
             strokeWidth = 5f
         }
@@ -77,6 +77,7 @@ class HourglassDreamService : DreamService() {
 
         private val sandPath = Path()
         private val clipPath = Path()
+        private val glassPath = Path()
         private val random = Random(System.currentTimeMillis())
 
         private val frameRunnable = object : Runnable {
@@ -122,32 +123,29 @@ class HourglassDreamService : DreamService() {
             val cycleIndex = (elapsed / fullCycleMs).toInt()
             val cyclePosMs = elapsed % fullCycleMs
 
-            // Po każdym pełnym obrocie (nieparzysty cykl) klepsydra jest odwrócona o 180°
-            val baseAngle = if (cycleIndex % 2 == 0) 0f else 180f
-
             val pourProgress: Float
-            val flipExtraAngle: Float
+            val glassAngle: Float
+            val isFlipping: Boolean
 
             if (cyclePosMs < pourDurationMs) {
-                // Etap 1: 60 sekund sypania ziarenek
+                // Etap 1: 60 s przesypywania piasku z góry na dół
                 pourProgress = (cyclePosMs.toFloat() / pourDurationMs.toFloat()).coerceIn(0f, 1f)
-                flipExtraAngle = 0f
+                glassAngle = (cycleIndex * 180f) % 360f
+                isFlipping = false
             } else {
-                // Etap 2: płynny obrót o 180°
+                // Etap 2: obrót klepsydry o kolejne 180°
                 pourProgress = 1f
                 val flipT = ((cyclePosMs - pourDurationMs).toFloat() / flipDurationMs.toFloat()).coerceIn(0f, 1f)
-                flipExtraAngle = 180f * easeInOutCubic(flipT)
+                glassAngle = ((cycleIndex * 180f) + 180f * easeInOutCubic(flipT)) % 360f
+                isFlipping = true
             }
 
-            // Delikatny ruch (pixel-shift) chroniący OLED przed wypaleniem
+            // Delikatny pixel-shift chroniący matrycę OLED
             val shiftX = sin(elapsed / 9000.0).toFloat() * (w * 0.03f)
             val shiftY = sin(elapsed / 13000.0).toFloat() * (h * 0.03f)
 
             val cx = w / 2f + shiftX
             val cy = h / 2f + shiftY
-
-            canvas.save()
-            canvas.rotate(baseAngle + flipExtraAngle, cx, cy)
 
             val hourglassHalfWidth = minOf(w, h) * 0.22f
             val hourglassHalfHeight = minOf(w, h) * 0.34f
@@ -157,7 +155,7 @@ class HourglassDreamService : DreamService() {
             val topY = cy - hourglassHalfHeight
             val bottomY = cy + hourglassHalfHeight
 
-            // Górny piasek (ubywa w ciągu 60s)
+            // 1. Górny piasek (zawsze ubywa w dół ekranu)
             val topFill = 1f - pourProgress
             if (topFill > 0.01f) {
                 canvas.save()
@@ -189,7 +187,7 @@ class HourglassDreamService : DreamService() {
                 canvas.restore()
             }
 
-            // Dolny piasek (przybywa w ciągu 60s)
+            // 2. Dolny piasek (zawsze rośnie od dołu ekranu w górę)
             val bottomFill = pourProgress
             if (bottomFill > 0.01f) {
                 canvas.save()
@@ -223,8 +221,8 @@ class HourglassDreamService : DreamService() {
                 canvas.restore()
             }
 
-            // Strumień i pojedyncze ziarenka podczas przesypywania
-            if (pourProgress < 0.995f && flipExtraAngle == 0f) {
+            // 3. Strumień i spadające ziarenka (zawsze w dół ekranu, tylko podczas sypania)
+            if (!isFlipping && pourProgress < 0.995f) {
                 val streamBottom = bottomY - hourglassHalfHeight * bottomFill
                 canvas.drawLine(cx, cy, cx, streamBottom, grainPaint)
 
@@ -236,35 +234,37 @@ class HourglassDreamService : DreamService() {
                 }
             }
 
-            // Szklany kontur klepsydry
-            sandPath.reset()
-            sandPath.moveTo(cx - hourglassHalfWidth, topY)
-            sandPath.lineTo(cx + hourglassHalfWidth, topY)
-            sandPath.cubicTo(
+            // 4. Szklany kontur i podstawy klepsydry (obracają się o 180° co cykl)
+            canvas.save()
+            canvas.rotate(glassAngle, cx, cy)
+
+            glassPath.reset()
+            glassPath.moveTo(cx - hourglassHalfWidth, topY)
+            glassPath.lineTo(cx + hourglassHalfWidth, topY)
+            glassPath.cubicTo(
                 cx + hourglassHalfWidth, topY + hourglassHalfHeight * 0.45f,
                 cx + neckHalfWidth, cy - hourglassHalfHeight * 0.12f,
                 cx + neckHalfWidth, cy
             )
-            sandPath.cubicTo(
+            glassPath.cubicTo(
                 cx + neckHalfWidth, cy + hourglassHalfHeight * 0.12f,
                 cx + hourglassHalfWidth, bottomY - hourglassHalfHeight * 0.45f,
                 cx + hourglassHalfWidth, bottomY
             )
-            sandPath.lineTo(cx - hourglassHalfWidth, bottomY)
-            sandPath.cubicTo(
+            glassPath.lineTo(cx - hourglassHalfWidth, bottomY)
+            glassPath.cubicTo(
                 cx - hourglassHalfWidth, bottomY - hourglassHalfHeight * 0.45f,
                 cx - neckHalfWidth, cy + hourglassHalfHeight * 0.12f,
                 cx - neckHalfWidth, cy
             )
-            sandPath.cubicTo(
+            glassPath.cubicTo(
                 cx - neckHalfWidth, cy - hourglassHalfHeight * 0.12f,
                 cx - hourglassHalfWidth, topY + hourglassHalfHeight * 0.45f,
                 cx - hourglassHalfWidth, topY
             )
-            sandPath.close()
-            canvas.drawPath(sandPath, glassPaint)
+            glassPath.close()
+            canvas.drawPath(glassPath, glassPaint)
 
-            // Górna i dolna podstawa
             val capHalfWidth = hourglassHalfWidth * 1.15f
             canvas.drawRoundRect(
                 cx - capHalfWidth,
