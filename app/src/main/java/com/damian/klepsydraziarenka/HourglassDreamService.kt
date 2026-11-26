@@ -3,6 +3,7 @@ package com.damian.klepsydraziarenka
 import android.content.Context
 import android.graphics.Canvas
 import android.graphics.Color
+import android.graphics.Matrix
 import android.graphics.Paint
 import android.graphics.Path
 import android.service.dreams.DreamService
@@ -50,8 +51,8 @@ class HourglassDreamService : DreamService() {
         private var isRunning = false
         private var startTimeMs = 0L
 
-        private val pourDurationMs = 60_000L // 60 s przesypywania
-        private val flipDurationMs = 1_200L  // 1,2 s pełnego, zgranego obrotu o 180°
+        private val pourDurationMs = 60_000L // 60 s przesypywania w dół ekranu
+        private val flipDurationMs = 1_200L  // 1,2 s obrotu klepsydry o 180°
         private val fullCycleMs = pourDurationMs + flipDurationMs
 
         private val glassPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
@@ -76,8 +77,9 @@ class HourglassDreamService : DreamService() {
         }
 
         private val sandPath = Path()
-        private val clipPath = Path()
-        private val glassPath = Path()
+        private val baseGlassPath = Path()
+        private val rotatedGlassPath = Path()
+        private val rotateMatrix = Matrix()
         private val random = Random(System.currentTimeMillis())
 
         private val frameRunnable = object : Runnable {
@@ -111,6 +113,44 @@ class HourglassDreamService : DreamService() {
             }
         }
 
+        private fun buildGlassPath(
+            path: Path,
+            cx: Float,
+            cy: Float,
+            halfW: Float,
+            halfH: Float,
+            neckHalfW: Float
+        ) {
+            val topY = cy - halfH
+            val bottomY = cy + halfH
+
+            path.reset()
+            path.moveTo(cx - halfW, topY)
+            path.lineTo(cx + halfW, topY)
+            path.cubicTo(
+                cx + halfW, topY + halfH * 0.45f,
+                cx + neckHalfW, cy - halfH * 0.12f,
+                cx + neckHalfW, cy
+            )
+            path.cubicTo(
+                cx + neckHalfW, cy + halfH * 0.12f,
+                cx + halfW, bottomY - halfH * 0.45f,
+                cx + halfW, bottomY
+            )
+            path.lineTo(cx - halfW, bottomY)
+            path.cubicTo(
+                cx - halfW, bottomY - halfH * 0.45f,
+                cx - neckHalfW, cy + halfH * 0.12f,
+                cx - neckHalfW, cy
+            )
+            path.cubicTo(
+                cx - neckHalfW, cy - halfH * 0.12f,
+                cx - halfW, topY + halfH * 0.45f,
+                cx - halfW, topY
+            )
+            path.close()
+        }
+
         override fun onDraw(canvas: Canvas) {
             super.onDraw(canvas)
             canvas.drawColor(Color.BLACK)
@@ -136,10 +176,10 @@ class HourglassDreamService : DreamService() {
                 0f
             }
 
-            // Kąt obrotu całej klepsydry: 0° -> 180° -> 360° ...
-            val totalAngle = (cycleIndex * 180f) + (180f * flipT)
+            // Kąt szkła: w trakcie obrotu rośnie płynnie o 180°, po obrocie zostaje stały (0° lub 180°)
+            val glassAngle = (cycleIndex * 180f) + (180f * flipT)
 
-            // Pixel-shift dla ochrony ekranu OLED
+            // Pixel-shift chroniący matrycę OLED
             val shiftX = sin(elapsed / 9000.0).toFloat() * (w * 0.03f)
             val shiftY = sin(elapsed / 13000.0).toFloat() * (h * 0.03f)
 
@@ -154,92 +194,46 @@ class HourglassDreamService : DreamService() {
             val topY = cy - hourglassHalfHeight
             val bottomY = cy + hourglassHalfHeight
 
-            // W trybie obrotu cała klepsydra (wraz z zawartością) obraca się jako jedna bryła.
-            // Po obrocie o 180° to, co było na dole (pełna komora), jest teraz na górze (topFill = 1.0),
-            // a to, co było na górze (pusta komora), jest na dole (bottomFill = 0.0).
-            val topFill = if (!isFlipping) {
-                1f - pourProgress
-            } else {
-                // Podczas obrotu w górnej połowie klepsydry jest już pełny piasek po poprzednim sypaniu,
-                // a w dolnej połowie na koniec obrotu będzie pusto — więc w układzie obracanym:
-                // "górna komora" (przed obrotem pusta) ma 0f, a "dolna komora" (przed obrotem pełna) ma 1f.
-                0f
-            }
+            buildGlassPath(baseGlassPath, cx, cy, hourglassHalfWidth, hourglassHalfHeight, neckHalfWidth)
+            rotateMatrix.setRotate(glassAngle, cx, cy)
+            baseGlassPath.transform(rotateMatrix, rotatedGlassPath)
 
-            val bottomFill = if (!isFlipping) {
-                pourProgress
-            } else {
-                1f
-            }
+            // Podczas obrotu pełna bańka jest na górze (wędruje z dołu razem z klepsydrą),
+            // a podczas sypania górna bańka opróżnia się w dół ekranu, a dolna rośnie od dołu.
+            val topFill = if (isFlipping) 1f else (1f - pourProgress)
+            val bottomFill = if (isFlipping) 0f else pourProgress
 
+            // 1. Piasek przycięty do aktualnego kształtu obróconego szkła
             canvas.save()
-            canvas.rotate(totalAngle, cx, cy)
+            canvas.clipPath(rotatedGlassPath)
 
-            // 1. Górna komora (w układzie klepsydry)
+            // Górna połowa ekranu (ubywa w dół)
             if (topFill > 0.01f) {
-                canvas.save()
-                clipPath.reset()
-                clipPath.moveTo(cx - hourglassHalfWidth, topY)
-                clipPath.lineTo(cx + hourglassHalfWidth, topY)
-                clipPath.cubicTo(
-                    cx + hourglassHalfWidth, topY + hourglassHalfHeight * 0.45f,
-                    cx + neckHalfWidth, cy - hourglassHalfHeight * 0.12f,
-                    cx + neckHalfWidth, cy
-                )
-                clipPath.lineTo(cx - neckHalfWidth, cy)
-                clipPath.cubicTo(
-                    cx - neckHalfWidth, cy - hourglassHalfHeight * 0.12f,
-                    cx - hourglassHalfWidth, topY + hourglassHalfHeight * 0.45f,
-                    cx - hourglassHalfWidth, topY
-                )
-                clipPath.close()
-                canvas.clipPath(clipPath)
-
                 val sandTopY = cy - hourglassHalfHeight * topFill
                 sandPath.reset()
-                sandPath.moveTo(cx - hourglassHalfWidth * 1.2f, sandTopY)
-                sandPath.quadTo(cx, sandTopY + 18f * (1f - topFill), cx + hourglassHalfWidth * 1.2f, sandTopY)
-                sandPath.lineTo(cx + hourglassHalfWidth * 1.2f, cy)
-                sandPath.lineTo(cx - hourglassHalfWidth * 1.2f, cy)
+                sandPath.moveTo(cx - hourglassHalfWidth * 1.4f, sandTopY)
+                sandPath.quadTo(cx, sandTopY + 18f * (1f - topFill), cx + hourglassHalfWidth * 1.4f, sandTopY)
+                sandPath.lineTo(cx + hourglassHalfWidth * 1.4f, cy)
+                sandPath.lineTo(cx - hourglassHalfWidth * 1.4f, cy)
                 sandPath.close()
                 canvas.drawPath(sandPath, sandPaint)
-                canvas.restore()
             }
 
-            // 2. Dolna komora (w układzie klepsydry)
+            // Dolna połowa ekranu (rośnie od dołu w górę)
             if (bottomFill > 0.01f) {
-                canvas.save()
-                clipPath.reset()
-                clipPath.moveTo(cx - neckHalfWidth, cy)
-                clipPath.lineTo(cx + neckHalfWidth, cy)
-                clipPath.cubicTo(
-                    cx + neckHalfWidth, cy + hourglassHalfHeight * 0.12f,
-                    cx + hourglassHalfWidth, bottomY - hourglassHalfHeight * 0.45f,
-                    cx + hourglassHalfWidth, bottomY
-                )
-                clipPath.lineTo(cx - hourglassHalfWidth, bottomY)
-                clipPath.cubicTo(
-                    cx - hourglassHalfWidth, bottomY - hourglassHalfHeight * 0.45f,
-                    cx - neckHalfWidth, cy + hourglassHalfHeight * 0.12f,
-                    cx - neckHalfWidth, cy
-                )
-                clipPath.close()
-                canvas.clipPath(clipPath)
-
                 val sandSurfaceY = bottomY - hourglassHalfHeight * bottomFill
                 val conePeakY = (sandSurfaceY - 26f * (1f - bottomFill * 0.6f)).coerceAtLeast(cy + 4f)
                 sandPath.reset()
-                sandPath.moveTo(cx - hourglassHalfWidth * 1.2f, sandSurfaceY + 10f)
+                sandPath.moveTo(cx - hourglassHalfWidth * 1.4f, sandSurfaceY + 10f)
                 sandPath.lineTo(cx, conePeakY)
-                sandPath.lineTo(cx + hourglassHalfWidth * 1.2f, sandSurfaceY + 10f)
-                sandPath.lineTo(cx + hourglassHalfWidth * 1.2f, bottomY)
-                sandPath.lineTo(cx - hourglassHalfWidth * 1.2f, bottomY)
+                sandPath.lineTo(cx + hourglassHalfWidth * 1.4f, sandSurfaceY + 10f)
+                sandPath.lineTo(cx + hourglassHalfWidth * 1.4f, bottomY + hourglassHalfHeight)
+                sandPath.lineTo(cx - hourglassHalfWidth * 1.4f, bottomY + hourglassHalfHeight)
                 sandPath.close()
                 canvas.drawPath(sandPath, sandPaint)
-                canvas.restore()
             }
 
-            // 3. Strumień ziarenek — tylko podczas spokojnego sypania (nie w trakcie obrotu)
+            // 2. Spadające ziarenka — zawsze lecą w dół ekranu podczas sypania
             if (!isFlipping && pourProgress < 0.995f) {
                 val streamBottom = bottomY - hourglassHalfHeight * bottomFill
                 canvas.drawLine(cx, cy, cx, streamBottom, grainPaint)
@@ -252,33 +246,12 @@ class HourglassDreamService : DreamService() {
                 }
             }
 
-            // 4. Szklany kontur i podstawy
-            glassPath.reset()
-            glassPath.moveTo(cx - hourglassHalfWidth, topY)
-            glassPath.lineTo(cx + hourglassHalfWidth, topY)
-            glassPath.cubicTo(
-                cx + hourglassHalfWidth, topY + hourglassHalfHeight * 0.45f,
-                cx + neckHalfWidth, cy - hourglassHalfHeight * 0.12f,
-                cx + neckHalfWidth, cy
-            )
-            glassPath.cubicTo(
-                cx + neckHalfWidth, cy + hourglassHalfHeight * 0.12f,
-                cx + hourglassHalfWidth, bottomY - hourglassHalfHeight * 0.45f,
-                cx + hourglassHalfWidth, bottomY
-            )
-            glassPath.lineTo(cx - hourglassHalfWidth, bottomY)
-            glassPath.cubicTo(
-                cx - hourglassHalfWidth, bottomY - hourglassHalfHeight * 0.45f,
-                cx - neckHalfWidth, cy + hourglassHalfHeight * 0.12f,
-                cx - neckHalfWidth, cy
-            )
-            glassPath.cubicTo(
-                cx - neckHalfWidth, cy - hourglassHalfHeight * 0.12f,
-                cx - hourglassHalfWidth, topY + hourglassHalfHeight * 0.45f,
-                cx - hourglassHalfWidth, topY
-            )
-            glassPath.close()
-            canvas.drawPath(glassPath, glassPaint)
+            canvas.restore()
+
+            // 3. Szkło i podstawy obrócone o glassAngle
+            canvas.save()
+            canvas.rotate(glassAngle, cx, cy)
+            canvas.drawPath(baseGlassPath, glassPaint)
 
             val capHalfWidth = hourglassHalfWidth * 1.15f
             canvas.drawRoundRect(
@@ -299,7 +272,6 @@ class HourglassDreamService : DreamService() {
                 10f,
                 framePaint
             )
-
             canvas.restore()
         }
     }
