@@ -49,7 +49,10 @@ class HourglassDreamService : DreamService() {
 
         private var isRunning = false
         private var startTimeMs = 0L
-        private val cycleDurationMs = 60_000L // Pełny cykl przesypania: 60 sekund
+
+        private val pourDurationMs = 60_000L // 1 minuta przesypywania piasku
+        private val flipDurationMs = 1_200L  // 1.2 s płynnego obrotu o 180°
+        private val fullCycleMs = pourDurationMs + flipDurationMs
 
         private val glassPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
             color = Color.argb(140, 200, 220, 240)
@@ -80,7 +83,7 @@ class HourglassDreamService : DreamService() {
             override fun run() {
                 if (!isRunning) return
                 invalidate()
-                postDelayed(this, 16L) // ~60 FPS
+                postDelayed(this, 16L)
             }
         }
 
@@ -97,6 +100,16 @@ class HourglassDreamService : DreamService() {
             removeCallbacks(frameRunnable)
         }
 
+        private fun easeInOutCubic(t: Float): Float {
+            val x = t.coerceIn(0f, 1f)
+            return if (x < 0.5f) {
+                4f * x * x * x
+            } else {
+                val f = -2f * x + 2f
+                1f - (f * f * f) / 2f
+            }
+        }
+
         override fun onDraw(canvas: Canvas) {
             super.onDraw(canvas)
             canvas.drawColor(Color.BLACK)
@@ -106,14 +119,35 @@ class HourglassDreamService : DreamService() {
             if (w <= 0f || h <= 0f) return
 
             val elapsed = System.currentTimeMillis() - startTimeMs
-            val progress = ((elapsed % cycleDurationMs).toFloat() / cycleDurationMs.toFloat()).coerceIn(0f, 1f)
+            val cycleIndex = (elapsed / fullCycleMs).toInt()
+            val cyclePosMs = elapsed % fullCycleMs
 
-            // Delikatny ruch (pixel-shift) chroniący matrycę OLED przed wypaleniem
-            val shiftX = sin(elapsed / 9000.0).toFloat() * (w * 0.04f)
-            val shiftY = sin(elapsed / 13000.0).toFloat() * (h * 0.04f)
+            // Po każdym pełnym obrocie (nieparzysty cykl) klepsydra jest odwrócona o 180°
+            val baseAngle = if (cycleIndex % 2 == 0) 0f else 180f
+
+            val pourProgress: Float
+            val flipExtraAngle: Float
+
+            if (cyclePosMs < pourDurationMs) {
+                // Etap 1: 60 sekund sypania ziarenek
+                pourProgress = (cyclePosMs.toFloat() / pourDurationMs.toFloat()).coerceIn(0f, 1f)
+                flipExtraAngle = 0f
+            } else {
+                // Etap 2: płynny obrót o 180°
+                pourProgress = 1f
+                val flipT = ((cyclePosMs - pourDurationMs).toFloat() / flipDurationMs.toFloat()).coerceIn(0f, 1f)
+                flipExtraAngle = 180f * easeInOutCubic(flipT)
+            }
+
+            // Delikatny ruch (pixel-shift) chroniący OLED przed wypaleniem
+            val shiftX = sin(elapsed / 9000.0).toFloat() * (w * 0.03f)
+            val shiftY = sin(elapsed / 13000.0).toFloat() * (h * 0.03f)
 
             val cx = w / 2f + shiftX
             val cy = h / 2f + shiftY
+
+            canvas.save()
+            canvas.rotate(baseAngle + flipExtraAngle, cx, cy)
 
             val hourglassHalfWidth = minOf(w, h) * 0.22f
             val hourglassHalfHeight = minOf(w, h) * 0.34f
@@ -123,8 +157,8 @@ class HourglassDreamService : DreamService() {
             val topY = cy - hourglassHalfHeight
             val bottomY = cy + hourglassHalfHeight
 
-            // Górny piasek (ubywa)
-            val topFill = 1f - progress
+            // Górny piasek (ubywa w ciągu 60s)
+            val topFill = 1f - pourProgress
             if (topFill > 0.01f) {
                 canvas.save()
                 clipPath.reset()
@@ -155,8 +189,8 @@ class HourglassDreamService : DreamService() {
                 canvas.restore()
             }
 
-            // Dolny piasek (przybywa)
-            val bottomFill = progress
+            // Dolny piasek (przybywa w ciągu 60s)
+            val bottomFill = pourProgress
             if (bottomFill > 0.01f) {
                 canvas.save()
                 clipPath.reset()
@@ -189,8 +223,8 @@ class HourglassDreamService : DreamService() {
                 canvas.restore()
             }
 
-            // Strumień spadających ziarenek
-            if (progress < 0.99f) {
+            // Strumień i pojedyncze ziarenka podczas przesypywania
+            if (pourProgress < 0.995f && flipExtraAngle == 0f) {
                 val streamBottom = bottomY - hourglassHalfHeight * bottomFill
                 canvas.drawLine(cx, cy, cx, streamBottom, grainPaint)
 
@@ -230,7 +264,7 @@ class HourglassDreamService : DreamService() {
             sandPath.close()
             canvas.drawPath(sandPath, glassPaint)
 
-            // Górna i dolna podstawa klepsydry
+            // Górna i dolna podstawa
             val capHalfWidth = hourglassHalfWidth * 1.15f
             canvas.drawRoundRect(
                 cx - capHalfWidth,
@@ -250,6 +284,8 @@ class HourglassDreamService : DreamService() {
                 10f,
                 framePaint
             )
+
+            canvas.restore()
         }
     }
 }
