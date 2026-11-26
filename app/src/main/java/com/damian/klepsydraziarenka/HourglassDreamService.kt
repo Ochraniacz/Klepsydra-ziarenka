@@ -1,11 +1,15 @@
 package com.damian.klepsydraziarenka
 
 import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Matrix
 import android.graphics.Paint
 import android.graphics.Path
+import android.graphics.RectF
+import android.os.BatteryManager
 import android.service.dreams.DreamService
 import android.view.View
 import kotlin.math.sin
@@ -50,6 +54,10 @@ class HourglassDreamService : DreamService() {
 
         private var isRunning = false
         private var startTimeMs = 0L
+        private var lastBatteryCheckMs = 0L
+
+        private var batteryLevelFraction = 0.5f // 0.0f .. 1.0f
+        private var isCharging = false
 
         private val pourDurationMs = 60_000L // 60 s przesypywania w dół ekranu
         private val flipDurationMs = 1_200L  // 1,2 s obrotu klepsydry o 180°
@@ -76,24 +84,86 @@ class HourglassDreamService : DreamService() {
             style = Paint.Style.FILL
         }
 
+        private val barTrackPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.argb(70, 255, 255, 255)
+            style = Paint.Style.FILL
+        }
+
+        private val barFillPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            style = Paint.Style.FILL
+        }
+
+        private val barBorderPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.argb(110, 220, 230, 240)
+            style = Paint.Style.STROKE
+            strokeWidth = 2f
+        }
+
         private val sandPath = Path()
         private val baseGlassPath = Path()
         private val rotatedGlassPath = Path()
         private val rotateMatrix = Matrix()
+        private val trackRect = RectF()
+        private val fillRect = RectF()
         private val random = Random(System.currentTimeMillis())
 
         private val frameRunnable = object : Runnable {
             override fun run() {
                 if (!isRunning) return
+                val now = System.currentTimeMillis()
+                if (now - lastBatteryCheckMs > 5_000L || lastBatteryCheckMs == 0L) {
+                    updateBatteryStatus()
+                    lastBatteryCheckMs = now
+                }
                 invalidate()
                 postDelayed(this, 16L)
             }
+        }
+
+        private fun updateBatteryStatus() {
+            val batteryIntent = context.registerReceiver(
+                null,
+                IntentFilter(Intent.ACTION_BATTERY_CHANGED)
+            ) ?: return
+
+            val level = batteryIntent.getIntExtra(BatteryManager.EXTRA_LEVEL, -1)
+            val scale = batteryIntent.getIntExtra(BatteryManager.EXTRA_SCALE, -1)
+            if (level >= 0 && scale > 0) {
+                batteryLevelFraction = (level.toFloat() / scale.toFloat()).coerceIn(0f, 1f)
+            }
+
+            val status = batteryIntent.getIntExtra(BatteryManager.EXTRA_STATUS, -1)
+            isCharging = status == BatteryManager.BATTERY_STATUS_CHARGING ||
+                status == BatteryManager.BATTERY_STATUS_FULL
+        }
+
+        private fun redToGreenColor(fraction: Float): Int {
+            val t = fraction.coerceIn(0f, 1f)
+            // Płynne przejście: czerwony (220, 45, 45) -> żółty (235, 195, 35) -> zielony (45, 205, 85)
+            val r: Int
+            val g: Int
+            val b: Int
+            if (t < 0.5f) {
+                val k = t * 2f
+                r = (220 + (235 - 220) * k).toInt()
+                g = (45 + (195 - 45) * k).toInt()
+                b = (45 + (35 - 45) * k).toInt()
+            } else {
+                val k = (t - 0.5f) * 2f
+                r = (235 + (45 - 235) * k).toInt()
+                g = (195 + (205 - 195) * k).toInt()
+                b = (35 + (85 - 35) * k).toInt()
+            }
+            val alpha = if (isCharging) 220 else 175
+            return Color.argb(alpha, r, g, b)
         }
 
         fun startAnimation() {
             if (!isRunning) {
                 isRunning = true
                 startTimeMs = System.currentTimeMillis()
+                lastBatteryCheckMs = 0L
+                updateBatteryStatus()
                 post(frameRunnable)
             }
         }
@@ -151,6 +221,28 @@ class HourglassDreamService : DreamService() {
             path.close()
         }
 
+        private fun drawTopBatteryBar(canvas: Canvas, w: Float, h: Float, shiftX: Float, elapsed: Long) {
+            val barWidth = w * 0.52f
+            val barHeight = (h * 0.014f).coerceIn(10f, 22f)
+            val left = (w - barWidth) / 2f + shiftX * 0.6f
+            val right = left + barWidth
+            val top = (h * 0.055f) + (sin(elapsed / 11000.0).toFloat() * (h * 0.01f))
+            val bottom = top + barHeight
+            val radius = barHeight / 2f
+
+            trackRect.set(left, top, right, bottom)
+            canvas.drawRoundRect(trackRect, radius, radius, barTrackPaint)
+
+            val fillWidth = (barWidth * batteryLevelFraction).coerceAtLeast(if (batteryLevelFraction > 0f) barHeight else 0f)
+            if (fillWidth > 0f) {
+                fillRect.set(left, top, left + fillWidth, bottom)
+                barFillPaint.color = redToGreenColor(batteryLevelFraction)
+                canvas.drawRoundRect(fillRect, radius, radius, barFillPaint)
+            }
+
+            canvas.drawRoundRect(trackRect, radius, radius, barBorderPaint)
+        }
+
         override fun onDraw(canvas: Canvas) {
             super.onDraw(canvas)
             canvas.drawColor(Color.BLACK)
@@ -176,12 +268,14 @@ class HourglassDreamService : DreamService() {
                 0f
             }
 
-            // Kąt szkła: w trakcie obrotu rośnie płynnie o 180°, po obrocie zostaje stały (0° lub 180°)
             val glassAngle = (cycleIndex * 180f) + (180f * flipT)
 
             // Pixel-shift chroniący matrycę OLED
             val shiftX = sin(elapsed / 9000.0).toFloat() * (w * 0.03f)
             val shiftY = sin(elapsed / 13000.0).toFloat() * (h * 0.03f)
+
+            // Pasek naładowania na górze ekranu
+            drawTopBatteryBar(canvas, w, h, shiftX, elapsed)
 
             val cx = w / 2f + shiftX
             val cy = h / 2f + shiftY
@@ -198,8 +292,6 @@ class HourglassDreamService : DreamService() {
             rotateMatrix.setRotate(glassAngle, cx, cy)
             baseGlassPath.transform(rotateMatrix, rotatedGlassPath)
 
-            // Podczas obrotu pełna bańka jest na górze (wędruje z dołu razem z klepsydrą),
-            // a podczas sypania górna bańka opróżnia się w dół ekranu, a dolna rośnie od dołu.
             val topFill = if (isFlipping) 1f else (1f - pourProgress)
             val bottomFill = if (isFlipping) 0f else pourProgress
 
@@ -207,7 +299,6 @@ class HourglassDreamService : DreamService() {
             canvas.save()
             canvas.clipPath(rotatedGlassPath)
 
-            // Górna połowa ekranu (ubywa w dół)
             if (topFill > 0.01f) {
                 val sandTopY = cy - hourglassHalfHeight * topFill
                 sandPath.reset()
@@ -219,7 +310,6 @@ class HourglassDreamService : DreamService() {
                 canvas.drawPath(sandPath, sandPaint)
             }
 
-            // Dolna połowa ekranu (rośnie od dołu w górę)
             if (bottomFill > 0.01f) {
                 val sandSurfaceY = bottomY - hourglassHalfHeight * bottomFill
                 val conePeakY = (sandSurfaceY - 26f * (1f - bottomFill * 0.6f)).coerceAtLeast(cy + 4f)
